@@ -1,4 +1,6 @@
 import pandas as pd
+pd.set_option('display.float_format', lambda x: '%.3f' % x)
+
 import sys
 from loguru import logger
 import sqlalchemy
