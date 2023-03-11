@@ -6,7 +6,7 @@ import numpy as np
 from giraldi_backend import *
 from giraldi_futures import *
 
-dull = True
+dull = False
 
 def fx_conversion(currency, position, reference_date):
     inverted = ('EUR', 'AUD', 'GBP', 'NZD')
@@ -39,8 +39,10 @@ def fx_conversion(currency, position, reference_date):
         return position/df.iloc[0,0]
 
 def net_cash(df, date):
+    df = df.copy()
+
     df['position'] = df['quantity'] * df['price']
-    df['position'] = df.apply(lambda x: 0 if x['asset_type'][-6:]=='future' or x['asset_type']=='fx' else x['position'], axis=1)
+    df['position'] = df.apply(lambda x: 0 if x['asset_type'][-7:]=='_future' or x['asset_type']=='fx' else x['position'], axis=1)
     df['position'] = df.apply(lambda x: fx_conversion(x['currency'], x['position'], date), axis=1)
     
     total = df['position'].sum()
@@ -48,12 +50,23 @@ def net_cash(df, date):
     df.drop('position', axis=1, inplace=True)
     return total
 
+def get_performance_mtm(df, date):
+    df = df.copy()
+    
+    if df.empty:
+        return df
+    
+    df['performance'] = df['quantity'] * (df['value'] - df['price'])
+    df['performance'] = df.apply(lambda x: 0 if x['asset_type'][-7:]=='_future' or x['asset_type']=='fx' else x['performance'], axis=1)
+    df['performance'] = df.apply(lambda x: fx_conversion(x['currency'], x['performance'], date), axis=1)
+    
+    return df
+
 def get_quotes(exposure, date):
     # get current prices
     stocks = exposure.loc[exposure['asset_type'].str.contains('_stock', regex=False), 'ticker'].unique()
     fx     = exposure.loc[exposure['asset_type'].str.contains(    'fx', regex=False), 'ticker'].unique()
     etfs     = exposure.loc[exposure['asset_type'].str.contains('_etf', regex=False), 'ticker'].unique()
-    # tickers = stocks + fx
     sql = f'''
         SELECT ticker, value FROM quotes
         WHERE rptdt = '{date.strftime("%d-%b-%Y")}'
@@ -88,6 +101,7 @@ if __name__ == '__main__':
     # get date of last exposure
     sql = f'''
         SELECT max(rptdt) FROM exposure
+        --where rptdt = '07-MAR-2023'
     '''
     date = pd.read_sql_query(sql, engine).iloc[0,0].date()
     today = datetime.date.today()
@@ -98,8 +112,8 @@ if __name__ == '__main__':
             date += datetime.timedelta(days=1)
             if date.weekday() >= 5:
                 continue
-            # elif input(f'skip {date.strftime("%d-%b-%Y")}? ') == 'y':
-            #     continue
+            elif input(f'skip {date.strftime("%d-%b-%Y")}? ').lower() == 'y':
+                continue
 
             logger.info(f'Working on exposure for {date.strftime("%d-%b-%Y")}')
 
@@ -107,6 +121,7 @@ if __name__ == '__main__':
                 SELECT rptdt, strategy, fund, book, trader, ticker, asset_type, quantity, price, currency FROM exposure
                 WHERE rptdt = (
                     SELECT max(rptdt) FROM exposure
+                    WHERE rptdt < '{date.strftime("%d-%b-%Y")}'
                 )
                 AND fund = '{fund}'
             '''
@@ -117,60 +132,99 @@ if __name__ == '__main__':
                 WHERE rptdt = '{date.strftime("%d-%b-%Y")}'
                 AND fund = '{fund}'
             '''
-            trades = pd.read_sql_query(sql, engine)
+            trades = pd.read_sql_query(sql, engine)           
 
             if trades.empty:
                 logger.info(f'No trades for {date.strftime("%d-%b-%Y")}')
-
-            if not trades.empty:
+            
+            else:
                 logger.info(f'Found {len(trades)} trades for {date.strftime("%d-%b-%Y")}')
 
                 # producing cash impact
-                yest_cash = net_cash(trades, date)
+                cash_impact = net_cash(trades, date)
 
                 exposure = pd.concat([exposure, trades])
+                # print('cash impact:', cash_impact)
 
-                exposure['quantity'] = exposure.apply(lambda x: (x['quantity']-yest_cash) if x['asset_type']=='Cash' and x['ticker']=='Cash' else x['quantity'], axis=1)
-
-                del yest_cash
+                exposure['quantity'] = exposure.apply(lambda x: (x['quantity']-cash_impact) if x['asset_type']=='Cash' and x['ticker']=='Cash' else x['quantity'], axis=1)
+                del cash_impact
 
             quotes = get_quotes(exposure, date)
 
             # update prices on the exposure
             exposure = exposure.merge(quotes, how='left')
-
+                              
             missing_prices = exposure[exposure['value'].isna()]
             if not missing_prices.empty:
                 logger.error(f'missing {date.strftime("%d-%b-%Y")} quotes for assets')
                 print(missing_prices[['trader', 'asset_type', 'ticker']])
                 sys.exit()
 
+            result_mtm = get_performance_mtm(exposure, date)
+            
             if len(exposure.loc[exposure['asset_type'].str.contains('future'), 'ticker']):
-                margin_impact = get_margin_impact(exposure)
-                # print(exposure)
-                # print('\n', margin_impact)
+                result_fut, margin_impact = get_margin_impact(exposure)
+                
                 exposure['quantity'] = exposure.apply(lambda x: x['quantity'] + margin_impact if x['ticker'] == 'Cash' else x['quantity'], axis=1)
-                # print(exposure)
+                result_mtm['quantity'] = result_mtm.apply(lambda x: x['quantity'] + margin_impact if x['ticker'] == 'Cash' else x['quantity'], axis=1)
+                
+                results = result_mtm.merge(result_fut, how='left', on=result_mtm.columns[:-1].to_list())
+                
+                results['result'] = results['performance_x'] + results['performance_y'].fillna(0)
+                results.drop(['performance_x', 'performance_y'], axis=1, inplace=True)
+            
+            else:
+                results = result_mtm
 
             exposure.drop('price', axis=1, inplace=True)
             exposure.rename({'value': 'price'}, axis=1, inplace=True)
-
+            
             cols = exposure.columns
+            exposure['rptdt'] = date
+            
+            today_nav = net_cash(exposure, date)
+
             exposure = exposure.groupby([column for column in cols if column != 'quantity'], as_index=False).sum()
+            
             exposure = exposure[cols]
-
-            exposure['rptdt'] = date        
-            # today_nav = net_cash(exposure)
-
+            exposure = exposure.loc[exposure['quantity']!=0]
+      
+            exposure.loc[exposure['asset_type']=='Cash', 'quantity'] += today_nav * (pow(1.0457, 1/252)-1)
+            results.loc[results['asset_type']=='Cash', 'quantity'] += today_nav * (pow(1.0457, 1/252)-1)
+            results.loc[results['asset_type']=='Cash', 'result'] = today_nav * (pow(1.0457, 1/252)-1)
+            results['rptdt'] = date
+            
+            # perf. attribution logic
+            sql_del_res = f'''
+                DELETE FROM results
+                WHERE rptdt = '{date.strftime("%d-%b-%Y")}'
+                AND fund = 'Laramie'
+            '''            
+            # NAV logic
+            sql_del_nav = f'''
+                DELETE FROM navs
+                WHERE rptdt = '{date.strftime("%d-%b-%Y")}'
+                AND fund = 'Laramie'
+            '''
+            sql_nav = f'''
+                INSERT INTO navs
+                VALUES ('{date.strftime("%d-%b-%Y")}', 'Laramie', {today_nav * pow(1.0457, 1/252)})
+            '''
             # insert exposure
-            sql = f'''
+            sql_del_exp = f'''
                 DELETE FROM exposure 
                 WHERE rptdt = '{date.strftime("%d-%b-%Y")}'
             '''
-            if not dull:
-                engine.execute(sql)
-                exposure.to_sql('exposure', engine, index=False, if_exists='append')
-            # print(exposure)
-            # exposure.to_clipboard()
-            # sys.exit()
 
+            # print(results)
+            if not dull:
+                engine.execute(sql_del_res)
+                results.to_sql('results', engine, index=False, if_exists='append')
+                engine.execute(sql_del_nav)
+                engine.execute(sql_nav)
+                engine.execute(sql_del_exp)
+                exposure.to_sql('exposure', engine, index=False, if_exists='append')
+            logger.success(f'inserted exposure for {date.strftime("%d-%b-%Y")}. NAV: {round(today_nav, 2) * pow(1.0457, 1/252)}')
+            # exposure.to_clipboard()
+            
+            # sys.exit()

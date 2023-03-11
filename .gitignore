@@ -2,3 +2,8 @@ temp*
 test*
 __pycache__
 .vscode
+get_*
+*_b3.py
+*.xlsx
+*.docx
+*.png
