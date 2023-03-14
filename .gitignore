@@ -2,8 +2,9 @@ temp*
 test*
 __pycache__
 .vscode
-get_*
-*_b3.py
+*_yf_*
+*_cme_*
+*_b3*
+*.csv
 *.xlsx
-*.docx
-*.png
+reports/office

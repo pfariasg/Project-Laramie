@@ -92,6 +92,9 @@ def ibov_fut_settlement(quantity, price, value):
 def dol_fut_settlement(quantity, price, value):
     return 50000 * quantity * (value-price)
 
+def nasdaq_100_settlement(quantity, price, value):
+    return 20 * quantity * (value-price)
+
 def _100_m_rate_settlement(quantity, price, value, contract_unit):
     return quantity * (value-price) * contract_unit
 
@@ -109,6 +112,10 @@ def get_settlement(row, reference_date):
     elif row['ticker'].startswith('UC') and row['asset_type'] == 'fx_future' and row['currency'] == 'BRL':
         return dol_fut_settlement(row['quantity'],row['price'], row['value'])
     
+    elif row['ticker'].startswith('NQ') and row['asset_type'] == 'equity_future' and row['currency'] == 'USD':
+        # https://www.cmegroup.com/markets/equities/nasdaq/e-mini-nasdaq-100.quotes.html
+        return nasdaq_100_settlement(row['quantity'],row['price'], row['value'])
+
     elif row['ticker'].startswith(('ZQ', 'SR1')) and row['asset_type'] == 'ir_future' and row['currency'] == 'USD':
         # https://www.cmegroup.com/markets/interest-rates/stirs/30-day-federal-fund.contractSpecs.html
         # 30 Days Fed Funds
